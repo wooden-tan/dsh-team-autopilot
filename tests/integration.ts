@@ -1387,6 +1387,138 @@ await test('says so when the status file cannot be written, and clears when it c
   const text = await readFile(join(dir, 'status.log'), 'utf8')
   assert.match(text, /team=team-1/, 'the recovered file holds real rounds')
 })
+await test('an idle host sleeps progressively longer instead of polling', async () => {
+  // The plugin is mounted but no Team has ever been created. There is no Lead to
+  // arm a change-wait on, so the round can only look again later. A fixed
+  // two-second retry there is a polling loop that runs for the life of the
+  // process: 43,200 wakeups a day that can never observe anything. The gap has
+  // to grow while the host stays idle, and stop growing at the configured
+  // interval so a newly created Team is still noticed promptly.
+  const delays: number[] = []
+  const controller = new AbortController()
+  const emptyCtx = { agents: { roots: () => [] } } as unknown as Context
+
+  await loop(
+    emptyCtx,
+    { ...baseConfig, tickTimeoutMs: 30_000 },
+    freshState(),
+    controller.signal,
+    undefined,
+    (ms: number) => {
+      delays.push(ms)
+      // Stop once the ceiling has been reached, so the test never waits.
+      if (delays.length === 5) controller.abort()
+      return Promise.resolve()
+    },
+  )
+
+  assert.deepEqual(
+    delays,
+    [2_000, 4_000, 8_000, 16_000, 30_000],
+    'the idle gap grows until the tick interval caps it',
+  )
+})
+await test('a session created while the loop is idle wakes it, instead of the back-off', async () => {
+  // No Lead yet: there is no change-wait to arm, so the round can only sleep.
+  // The host creates its first session while it sleeps, and `agent/created` is
+  // the documented edge for exactly that. Sleeping out the back-off instead
+  // would delay the first dispatch by up to the configured interval even though
+  // the event had already said a Lead exists.
+  const root = { id: 'root' } as unknown as Agent
+  let roots: Agent[] = []
+  const listeners = new Map<string, (payload: unknown) => void>()
+  let armed = 0
+  let idleSleeps = 0
+  const controller = new AbortController()
+
+  const ctx = {
+    agents: { roots: () => roots },
+    on: (name: string, listener: (payload: unknown) => void) => {
+      listeners.set(name, listener)
+      return () => {
+        listeners.delete(name)
+      }
+    },
+    agentTeams: {
+      tryMembership: (agent: Agent) => (agent === root ? { id: 'team-1', role: 'lead' } : undefined),
+      listTasks: (): TeamTaskView[] => [],
+      listMembers: (): TeamMemberView[] => [],
+      waitForChange: async () => {
+        armed += 1
+        // The round has already proved it woke on the creation, so leave.
+        controller.abort()
+      },
+    },
+  } as unknown as Context
+
+  const run = loop(
+    ctx,
+    { ...baseConfig, tickTimeoutMs: 30_000 },
+    freshState(),
+    controller.signal,
+    undefined,
+    () => {
+      idleSleeps += 1
+      // Never resolves: a host with an event bus must not need this at all.
+      return new Promise<void>(() => {})
+    },
+  )
+
+  // The loop reaches its idle wait synchronously, so the creation that follows
+  // is exactly the "session appears while the loop is idle" case.
+  setTimeout(() => {
+    roots = [root]
+    listeners.get('agent/created')?.({ agent: root, source: 'fresh' })
+  }, 10)
+
+  const outcome = await Promise.race([
+    run.then(() => 'loop' as const),
+    new Promise<'timeout'>((resolve) => {
+      setTimeout(() => resolve('timeout'), 2_000)
+    }),
+  ])
+
+  assert.equal(outcome, 'loop', 'the loop woke on the creation instead of waiting out a timer')
+  assert.equal(armed, 1, 'the round after the wake armed a change-wait on the new Lead')
+  assert.equal(idleSleeps, 0, 'a host with an event bus arms no timer at all')
+})
+await test('a root that is not a Lead gets one bounded re-read, not a poll', async () => {
+  // `tryMembership` can answer "not a Lead" for a live root: the identity may be
+  // mid-recomposition, or the root may be a provider-owned worker of another
+  // Team implementation. That state can settle without any creation event, so
+  // the idle round re-reads it once after a short grace — but it must not become
+  // a cadence, or a permanent non-Lead root would wake the host every second for
+  // the life of the process.
+  const delays: number[] = []
+  const controller = new AbortController()
+  const providerRoot = { id: 'provider' } as unknown as Agent
+  const ctx = {
+    agents: { roots: () => [providerRoot] },
+    on: () => () => {},
+    agentTeams: { tryMembership: () => undefined },
+  } as unknown as Context
+
+  const run = loop(
+    ctx,
+    { ...baseConfig, tickTimeoutMs: 30_000 },
+    freshState(),
+    controller.signal,
+    undefined,
+    (ms: number) => {
+      delays.push(ms)
+      return Promise.resolve()
+    },
+  )
+  await new Promise<void>((resolve) => setTimeout(resolve, 50))
+  controller.abort()
+  await run
+
+  assert.deepEqual(
+    delays,
+    [1_000],
+    'the unexplainable state is re-read once, then the loop parks on the edge',
+  )
+})
 if (failures.length > 0) {
   console.error(`FAILED ${failures.length}`)
   for (const line of failures) console.error(`  - ${line}`)

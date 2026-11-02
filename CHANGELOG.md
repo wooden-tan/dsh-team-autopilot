@@ -5,6 +5,61 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang-CN/)。
 
+## [Unreleased] - 2026-11-02
+
+### 停止
+
+- **项目停止维护。** 不再加功能、不再排待办，代码停在 0.6.7。原因、停止前逐条核实的官方能力边界（投递确认 / token 预算 / per-member model / 独立工作目录 / toolPolicies / 叫醒 Lead / 命令面）、磁盘上的残留与卸载方式，见 [docs/stopped.md](docs/stopped.md)。
+- 文档更正：README 设计决策第 10 条末「想让卡死/停派主动上报到 Lead 时路是堵的」不准确。`Agent.inject()` 能把消息递到 Lead 的下一步，只是**不唤醒**空闲 driver；`steer()` 与 `send(msg, target, wakeup=true)` 能唤醒，代价是一整轮 token，且消息以 user 角色出现在 Lead 会话里。因此上报仍只走三条零 token 通道。
+
+## [0.6.7] - 2026-11-02
+
+### 修复
+
+- **有事件总线的宿主上，空闲等待不再挂任何定时器。** 0.6.6 把零 Lead 的等待接到 `agent/created`，但仍让事件与 2→30 秒退避**竞速**：「万一某次事件没被观察到」。这条保险本身站不住——宿主 `AgentLoop.enter()` 先 `store.set` 登记、之后才 `announce()` 发 `agent/created`，所以「root 出现在 `ctx.agents.roots()` 里」与「事件会发」是同一条代码路径，不是两个可能脱节的系统；订阅在循环起始同步装好，检查与等待之间的窗口又由 latch 盖住。也就是说事件不是「可能变了」的提示，而是状态变化本身，定时器只会在同一张空注册表上重复问同一个问题。现在 `waitForIdleEdge` 在 `available` 时**只等事件**，不创建定时器；稳态空闲唤醒从 ~2,880 次/天降到 0。
+  - 唯一保留的有界等待是**一个事件解释不了的状态**：`tryMembership` 对活着的 root 也可能答「不是 Lead」（会话重组中的旧身份、provider-owned root、名册写入还在路上）。这类状态可能自己好，所以零 Lead 后的第一轮给一次 1 秒内的重读（`ROOT_GRACE_MS`），之后回到事件——不会变成「每秒看一眼」的新轮询。
+  - 退避序列（`idleRetryDelay`，2s→30s）保持原样，但只剩一个使用者：完全没有事件总线的宿主（`available=false`，只出现在测试与裁剪宿主）。`tests/verify.ts` 与 `tests/integration.ts` 的「无事件总线仍退避」用例继续跑这条路径。
+
+### 加固
+
+- `tests/verify.ts` 77 项不变，改一项断言并换用途：`a reachable edge arms no timer at all`——有事件总线时唤醒不得触碰 sleeper（`sleeps === 0`），不再只是「定时器被取消」；同时新增有界重读 `{ timeout: true }` 的断言。红：旧接线为 `1 !== 0`。
+- `tests/integration.ts` 47 → 48。`a session created while the loop is idle wakes it` 改为在等待装好之后从外部发 `agent/created`，并断言 `idleSleeps === 0`（旧接线为 `1`）。新增 `a root that is not a Lead gets one bounded re-read, not a poll`：挂一个永远解析不出 Lead 的 provider root，断言只请求一次 1 秒重读、随后停在事件上；把 `unclaimed` 强制为 `false` 时该用例为红（期望 `[1000]`，实际 `[]`）。
+
+### 真机复验（2026-11-02T15:40:44Z–15:40:51Z，headless lab 宿主）
+
+测试桩能证接线，不能证宿主契约。用独立 profile `autopilot-lab-hl`（`@deepseek-ai/dsh-base` + `@deepseek-ai/dsh-headless` + `@deepseek-ai/dsh-experimental-agent-team-profile` + `dsh-team-autopilot` 0.6.7，`dryRun=true`，独立日志）跑了一次真宿主，探针是 `.probe/real-host-wake.mjs`：
+
+1. `15:40:44.200Z autopilot-start version=0.6.7` —— 插件真挂上了。
+2. 之后 **8 秒**里日志零新增行：没有 Lead 时循环停在 `agent/created` 上，确实没有定时器醒来。
+3. `15:40:51.203Z` 从 stdin 提交任务（此前 stdin 一直开着，所以宿主已经空转，root agent 尚未创建）；`15:40:51.227Z` 出现 `team=session-25b05881-902d-4f3a-a209-bbf31e74245d ticks=1 …` —— 创建到被唤醒相隔 **24 毫秒**，远在退避地板 2 秒之下。
+4. 同一次运行里模型调用因 `MISSING_CREDENTIAL` 失败，但唤醒发生在此之前：被等的是 agent 创建，不是模型回合。
+
+## [0.6.6] - 2026-11-02
+
+### 修复
+
+- **没有团队时的等待仍是定时轮询，不是事件。** 0.6.5 把固定 2 秒重试换成 2→30 秒退避，空转频率降下来了，但它只改了**频率**：没有 Lead 时 `runRound` 依旧睡到一个定时器醒来再看一眼，而这个定时器并不知道「什么时候才会有 Lead」。官方文档给出了那个时刻——每个普通 runtime root 都是自己那个 Team 的隐式 Lead（`TeamId` 等于 `SessionId`），不存在「团队创建」事件，而**有 Lead 时**名册与任务的每次变更都由原生 `waitForChange` 唤醒。所以空闲分支真正缺的边沿只有一个：**一个新的 root agent 被创建**，即宿主的 `agent/created`。现在 `loop` 启动时订阅它，命中即唤醒；退避序列仍是兜底上限，不再是主路径。
+  - 事件边沿在 `src/wakeup.ts`：`createTeamEdge(ctx)` 只认 `parentAgent` 缺失的 root（子 agent 永远不可能是 Lead，且另一套 Team 实现把成员建成普通子 agent，这道过滤让两者在事件层互不干扰），没人等的时候把先到的创建 latch 住，`dispose()` 退订，宿主没有 `on` 时 `available=false`；`waitForIdleEdge(edge, sleep, ms, signal)` 让事件与兜底竞速，先到的一侧取消另一侧的定时器——否则被事件叫醒的那一轮会白挂一个最长 30 秒的定时器。
+  - `loop` 在退出前 `idleEdge.dispose()`（两条 abort 提前返回改成 `break`，收尾统一走一次退订），热重载不会留下两个监听者。
+  - `agent/created` 是 `@mode serial`：监听器抛出会让**该 agent 创建失败**，因此监听体整体 try/catch，坏 payload 直接忽略。
+
+### 加固
+
+- `tests/verify.ts` 73 → 77（+4）：只有 root 能唤醒（子 agent 不能）、无人等待时先到的创建被 latch、事件先到时兜底定时器被取消、没有事件总线的宿主与事件漏掉时仍走退避、abort 能释放等待。
+- `tests/integration.ts` 46 → 47：`a session created while the loop is idle wakes it, instead of the back-off`——真实 `loop` 挂在零 Lead 的 ctx 上，注入的 `sleep` 永不 resolve，睡眠中创建第一个会话并发出 `agent/created`；断言循环仍醒来、下一轮给新 Lead 挂上 `waitForChange`。已用「把这行改回 `await sleep(...)`」确认它在旧接线上为红（2 秒护栏后 `'timeout' !== 'loop'`）。
+
+## [0.6.5] - 2026-11-02
+
+### 修复
+
+- **一个团队都没有时，循环是每 2 秒一次的常驻轮询。** 有 Lead 时它会为每个团队挂一个 `waitForChange`，靠事件醒来；可**没有任何团队**时无事可挂，`runRound` 只能清空缓存、睡 2 秒、再回来问一次。插件一旦挂载（哪怕一整天没人建过团队），这就是每天 43,200 次醒来看一张空注册表——不产生任何决策、不做任何记录，纯 CPU 与无意义的配置读取。修法是把这段睡眠改成**退避**：2s、4s、8s…，以 `tickTimeoutMs` 封顶且不超过 30s，一旦重新发现团队立刻回到 2s。新团队出现最多晚一次检查被发现，上限 30s。
+  - 抽成纯函数 `idleRetryDelay(idleRounds, ceilingMs)`（`src/dispatch.ts`），并给 `loop` 加了一个可注入的 `sleep` 参数——否则这段节奏只能靠「真等 30 秒」来测。
+
+### 加固
+
+- `tests/verify.ts` 新增 8 项断言覆盖退避策略：地板、逐轮翻倍、以配置窗口封顶、指数也被封顶、窗口比地板还小时地板优先、一小时窗口不会变成一小时睡眠、延迟单调不减。
+- `tests/integration.ts` 新增 `an idle host sleeps progressively longer instead of polling`：用注入的 `sleep` 跑真实的 `loop`（零 Lead 的 ctx），断言请求的睡眠序列正好是 `[2000, 4000, 8000, 16000, 30000]`。已用「把这段睡眠改回固定 2 秒」确认它在旧代码上为红（报 `[2000, 2000, 2000, 2000, 2000]`）。
+
 ## [0.6.4] - 2026-10-29
 
 ### 修复

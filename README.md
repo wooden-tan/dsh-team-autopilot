@@ -2,6 +2,8 @@
 
 **Deterministic auto-dispatch for the native Agent Teams seam (`ctx.agentTeams`).**
 
+> **项目已停止维护（2026-11-02）。** 原因、停止前最后核实的官方能力边界、磁盘上的残留与卸载方式，见 [docs/stopped.md](docs/stopped.md)。下文保留为停止时的快照，不再更新；其中「为什么异常不能叫醒 Lead」一节（设计决策第 10 条末）的结论过时，以 `docs/stopped.md` 的更正为准。
+
 ![左边是原生 Agent Teams：任务 ready、两个成员空闲，但没有人被叫醒。右边是同一块板子在插件下一轮的观测：任务出现、唤醒 worker-c、被认领、完成，约 2 秒，路径中没有任何模型调用。](https://raw.githubusercontent.com/wooden-tan/dsh-team-autopilot/main/assets/how-it-works.png)
 
 上图的右侧不是示意：底部三行是 2026-10-28 真机日志的原样字段，可对照 [真机验证记录](#真机验证记录)。图由 `scripts/render-assets.py` 从这些字段渲染，不是手绘。
@@ -121,7 +123,7 @@ dsh plugin --profile web add dsh-team-autopilot
 | 键                | 默认      | 说明                         |
 | ---------------- | ------- | -------------------------- |
 | `enabled`        | `true`  | 关掉后只保留状态工具，不跑循环            |
-| `tickTimeoutMs`  | `30000` | 每次等待窗口，原生硬限制 10000–3600000 |
+| `tickTimeoutMs`  | `30000` | 每次等待窗口，原生硬限制 10000–3600000；一个团队都没有、且宿主没有事件总线时，这个值仍是空闲退避的上限（见下） |
 | `maxConcurrent`  | `2`     | 团队并发预算默认值（见下）                  |
 | `wakeCooldownMs` | `60000` | 同一任务在该窗口内不重复唤醒             |
 | `dryRun`         | `false` | 只记录决策，不发消息                 |
@@ -142,6 +144,8 @@ dsh plugin --profile web add dsh-team-autopilot
 | `wakeBudgetPerHour` | `0` | 每队**滚动一小时**内最多发起多少次唤醒（一次唤醒 = 一个模型回合，也就是钱）。`0` = 不设上限。花完的那一轮不再派发，记 `why=budget` 并累加 `budgetSkips` |
 
 数值越界会被收敛：schema 先拒绝明显非法的输入，`resolveConfig` 再兜一层。兜底这一层不是装饰——`maxConcurrent: 0` 会把槽位永久归零，`halfOpenProbe: 0` 会让熔断器卡在 half-open、从此再不发一条唤醒，而两者都不报错，看起来和「今天没活」一模一样。`cordis.patch.yml` 只设 `enabled: true`，其余全部走 schema 默认值——默认值只有一份，把数字抄进 patch 会在默认值改动时悄悄覆盖掉用户意图。要改就在自己的 profile 里按 `id: team-autopilot` 覆盖。
+
+**一个团队都没有时的等待是事件，不是定时器。** 有 Lead 时循环为每个团队挂 `waitForChange`，名册或任务一变就醒——这就是原生团队服务的行为，插件只是复用。真正没有任何 Lead 时无事可挂，于是循环改等宿主文档化的 `agent/created`：每个普通 runtime root 都是它自己那个 Team 的隐式 Lead（`TeamId` = `SessionId`），所以「新建团队」在事件层就是「一个新的 root 出现」。只认没有 `parentAgent` 的 root——子 agent 不可能是 Lead，另一套 Team 实现把成员建成普通子 agent，这道过滤让两套插件在事件层互不干扰。有事件总线的宿主上**不挂任何定时器**：宿主发布 root 与发出 `agent/created` 是同一条路径（`AgentLoop.enter()` 先登记、再 announce），所以事件是状态变化本身，而不是「可能变了」的提示；「查完、还没开始等」之间的窗口由 latch 盖住，因此这段等待不花一次唤醒。唯一的定时是「root 在、却解析不出 Lead」（会话重组中的旧身份、provider root）——一次 1 秒内的有界重读，之后回到事件。退避序列（2s→30s）只剩一个使用者：完全没有事件总线的宿主（生产不会出现，测试与裁剪宿主会），那里最迟一次退避仍会知道。
 
 
 ## 设计决策（都来自源码核验）
@@ -219,8 +223,8 @@ npm publish             # prepack 自动重建 dist；prepublishOnly 跑类型�
 
 ```bash
 node node_modules/typescript/bin/tsc --noEmit   # → 零错误
-node tests/verify.ts                            # → OK — 71 checks passed
-node tests/integration.ts                       # → OK — 45 integration checks passed
+node tests/verify.ts                            # → OK — 77 checks passed
+node tests/integration.ts                       # → OK — 48 integration checks passed
 node scripts/acceptance.mjs                     # → ✅ 全部通过 — 28/28 项验收通过
 node scripts/verify-status.mjs                  # → PASS（用真实 dsh-tools 编译器校验输出 schema）
 node scripts/verify-pack.mjs                    # → 7 required files, 0 forbidden, 0 dangling
@@ -231,8 +235,8 @@ node scripts/verify-pack.mjs                    # → 7 required files, 0 forbid
 > `verify:status` 是唯一用**真实 `dsh-tools` schema 编译器**校验 `team_autopilot_status` 输出的脚本——输出 schema 若被宿主拒绝，工具会在安装后静默失效（不报错、不派发），只有这一项能提前拦住。它同时覆盖冷启动（无团队）与热状态（带 `lastReclaim` / `lastDispatch` 嵌套对象，冷启动永远不会走到）两种形态，并额外守三道漂移：**输出 schema 的键集合必须与真实报告逐键相等**（`required` 的键必须真的出现）、**`Config` 的默认值必须逐键等于 `resolveConfig()`**，以及**本页配置表必须逐键记录同样的默认值**（表格与 schema 曾经漂移过：`liveness*` 三个键发版时就没进表）。已接进 `prepublishOnly`，发布前必跑。
 
 - **类型对账通过**：`devDependencies` 钉住 `0.2.1-rc.2`，代码逐条对过它的 `.d.ts`；`peerDependencies` 写的是范围 `>=0.2.1-rc.2 <0.3.0 || >=0.2.2-alpha.2 <0.3.0-0`，会自动接受后续 rc（上游现在 `next` 是 `0.2.1-rc.4`）**与 alpha 线**（上游 `alpha` 是 `0.2.2-alpha.2`），但没有逐个 rc/alpha 复核过——升级时请重跑 `tsc` 与 `npm test`。那个 `||` 分支不是冗余：node-semver 只允许预发布版本满足「自身 `major.minor.patch` 元组带预发布标签」的那个比较符，所以 `>=0.2.1-rc.2 <0.3.0` 会**静默**漏掉 `0.2.2-alpha.2`，pnpm 届时会悄悄换一个版本装上。上游 contributing 指南点名了这个坑，`scripts/verify-pack.mjs` 里有守卫盯着它。
-- **零依赖自检**：`tests/verify.ts` 的 72 项断言覆盖纯函数核心（选任务、选成员、写域冲突、并发预算、唤醒预留、未认领任务占作用域、调用方实时板的停派折叠、卡死观察窗、健康判决的处置顺序、存活时长的人读格式、滚动一小时的唤醒预算与它的 `why=budget` 归因、熔断状态机、团队桶上限）与输出格式（日志行、状态签名、启动标记、裁剪后启动标记的存续）。`select.ts` / `breaker.ts` / `stall.ts` / `budget.ts` / `observe.ts` 只有 `import type` 或无外部依赖，所以这个脚本不需要任何 `node_modules` 也能跑。
-- **进程内联调**：`tests/integration.ts` 用可控宿主桩驱动真实 `tick()` 与 `loop()`，45 项断言覆盖唤醒空闲成员、写域冲突拦截、连续失败触发熔断、`TeamId` 级预算覆盖、回收达到上限后停派、卡死上报与单次中断、唤醒未 claim 时不重复派发、成员明确拒绝后任务立刻换人（不等满冷却）、回收后立刻改派（不等旧冷却）、`dryRun` 不伪造拒绝、唤醒预算花完后停手并在窗口滚动后恢复、宿主异常后循环保活、裁剪失败按时间退避且能恢复、裁剪后启动标记只留一行、状态写入超时，以及三条容易「看起来对但其实没生效」的时序/写入规则——每团队每 interval 只 tick 一次、唤醒判定不早于冷却到期、只有累计计数变化的轮次不写日志。`dispatch.ts` 不 import `dsh-tools`，所以同样零 `node_modules` 可跑。
+- **零依赖自检**：`tests/verify.ts` 的 77 项断言覆盖纯函数核心（选任务、选成员、写域冲突、并发预算、唤醒预留、未认领任务占作用域、调用方实时板的停派折叠、卡死观察窗、健康判决的处置顺序、存活时长的人读格式、滚动一小时的唤醒预算与它的 `why=budget` 归因、熔断状态机、团队桶上限）与输出格式（日志行、状态签名、启动标记、裁剪后启动标记的存续）。`select.ts` / `breaker.ts` / `stall.ts` / `budget.ts` / `observe.ts` 只有 `import type` 或无外部依赖，所以这个脚本不需要任何 `node_modules` 也能跑。
+- **进程内联调**：`tests/integration.ts` 用可控宿主桩驱动真实 `tick()` 与 `loop()`，48 项断言覆盖唤醒空闲成员、写域冲突拦截、连续失败触发熔断、`TeamId` 级预算覆盖、回收达到上限后停派、卡死上报与单次中断、唤醒未 claim 时不重复派发、成员明确拒绝后任务立刻换人（不等满冷却）、回收后立刻改派（不等旧冷却）、`dryRun` 不伪造拒绝、唤醒预算花完后停手并在窗口滚动后恢复、宿主异常后循环保活、裁剪失败按时间退避且能恢复、裁剪后启动标记只留一行、状态写入超时，以及三条容易「看起来对但其实没生效」的时序/写入规则——每团队每 interval 只 tick 一次、唤醒判定不早于冷却到期、只有累计计数变化的轮次不写日志。`dispatch.ts` 不 import `dsh-tools`，所以同样零 `node_modules` 可跑。
 
 ## 开发环境注意事项
 
@@ -278,6 +282,8 @@ dsh web
 ```
 
 逐场景验证（含失败排查表、dryRun 各场景、熔断、真实派发）见 [`docs/verify-host.md`](docs/verify-host.md)；**僵死回收专项**见 [`docs/verify-reclaim.md`](docs/verify-reclaim.md)（含三个触发条件的可制造性、时序预期、负向场景）；**可直接粘贴进 Harness 的提示词**见 [`docs/prompts-reclaim.md`](docs/prompts-reclaim.md)。挂载自检：`node scripts/verify-mount.mjs`（`npm run verify:mount`）。
+
+> 主用另一个调度插件（例如 `@nanmicoder/dsh-agent-teams`）、本插件只作备用时，真机回归要开一个**独立 profile**——它不读别人的任务板，只有在原生 Agent Teams 服务上才看得到东西。一次性搭建、两个必须知道的坑、烟测流程见 [`docs/lab-profile.md`](docs/lab-profile.md)。
 
 观察点：
 

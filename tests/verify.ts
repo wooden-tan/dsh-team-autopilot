@@ -37,8 +37,9 @@ import { createLiveness } from '../src/liveness.ts'
 import { appendStatusLineWith, startupLine, statusLine, statusSignature } from '../src/observe.ts'
 import { teamState } from '../src/state.ts'
 import { createAutopilotState } from '../src/state.ts'
-import { forgetMissing, pruneWakeMap } from '../src/dispatch.ts'
+import { forgetMissing, idleRetryDelay, pruneWakeMap } from '../src/dispatch.ts'
 import { WAKE_WINDOW_MS, pruneWakeStamps, wakeAllowance } from '../src/budget.ts'
+import { createTeamEdge, waitForIdleEdge } from '../src/wakeup.ts'
 
 /** Build one task view with sane defaults. `id` stays a plain string here. */
 function task(over: Omit<Partial<TeamTaskView>, 'id'> & { id: string }): TeamTaskView {
@@ -1423,6 +1424,198 @@ test('forgets wake stamps that can no longer suppress anything', () => {
   const noCooldown = new Map([['live', now]])
   pruneWakeMap(noCooldown, [task({ id: 'live' })], now, 0)
   assert.equal(noCooldown.size, 0, 'a zero cooldown keeps no stamps')
+})
+
+test('an idle host backs off instead of polling every two seconds', () => {
+  // With no Lead there is no change-wait to arm, so the round can only look
+  // again later. A fixed two-second retry there is not "waiting", it is a
+  // polling loop that runs for the life of the process: 43,200 wakeups a day
+  // that can never observe anything. The delay must grow while the host stays
+  // idle, and it must stop growing at the configured interval so a Team that
+  // appears is still noticed promptly.
+  assert.equal(idleRetryDelay(0, 30_000), 2_000, 'the first idle round waits the floor')
+  assert.equal(idleRetryDelay(1, 30_000), 4_000)
+  assert.equal(idleRetryDelay(2, 30_000), 8_000)
+  assert.equal(idleRetryDelay(3, 30_000), 16_000)
+  assert.equal(idleRetryDelay(4, 30_000), 30_000, 'the configured interval is the ceiling')
+  assert.equal(idleRetryDelay(99, 30_000), 30_000, 'the ceiling also bounds the exponent')
+
+  // A tiny or huge configured interval must not invert the policy: the floor
+  // still applies below it, and idle sleep is still capped well under it.
+  assert.equal(idleRetryDelay(0, 1_000), 2_000, 'the floor wins over a shorter interval')
+  assert.equal(idleRetryDelay(8, 3_600_000), 30_000, 'an hour-long interval does not imply an hour-long sleep')
+
+  // Never decreasing: a back-off that can shrink would make the loop's pace
+  // depend on where it happens to be in the exponent.
+  let previous = 0
+  for (let round = 0; round < 12; round += 1) {
+    const delay = idleRetryDelay(round, 30_000)
+    assert.ok(delay >= previous, 'the delay never shrinks as the idle streak grows')
+    previous = delay
+  }
+})
+
+/** The exact host slice the wake edge reads. */
+type HostCtx = Parameters<typeof createTeamEdge>[0]
+
+/**
+ * A host that only offers the agent event bus.
+ *
+ * `agent/created` is a documented host event, but a headless context has to be
+ * told about it, so the fake keeps its listeners addressable and counts them.
+ */
+function eventHost(): {
+  ctx: HostCtx
+  emit: (name: string, payload: unknown) => void
+  listenerCount: () => number
+} {
+  const listeners = new Map<string, (payload: unknown) => void>()
+  const ctx = {
+    on: (name: string, listener: (payload: unknown) => void) => {
+      listeners.set(name, listener)
+      return () => {
+        listeners.delete(name)
+      }
+    },
+  } as unknown as HostCtx
+  return {
+    ctx,
+    listenerCount: () => listeners.size,
+    emit: (name: string, payload: unknown) => {
+      listeners.get(name)?.(payload)
+    },
+  }
+}
+
+/** Turn "still waiting" into an assertion instead of a hung test. */
+async function stillWaiting(waiting: Promise<void>): Promise<boolean> {
+  const pending = Symbol('pending')
+  const outcome = await Promise.race([
+    waiting.then(() => 'settled' as const),
+    new Promise<typeof pending>((resolve) => {
+      setTimeout(() => resolve(pending), 20)
+    }),
+  ])
+  return outcome === pending
+}
+
+/** Fail the test instead of hanging when an expected edge never arrives. */
+function within(waiting: Promise<void>, label: string): Promise<void> {
+  return Promise.race([
+    waiting,
+    new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error(`never settled: ${label}`)), 200)
+    }),
+  ])
+}
+
+await testAsync('only a runtime root wakes the idle wait', async () => {
+  // With no Lead there is nothing to arm, so the loop's one useful edge is "a
+  // root agent appeared". A subagent creation must not wake it: a subagent can
+  // never be a Lead, and another Team implementation creates its members as
+  // ordinary subagents — waking on those would couple this plugin to it.
+  const host = eventHost()
+  const edge = createTeamEdge(host.ctx)
+  assert.equal(edge.available, true, 'a host with an event bus exposes the edge')
+
+  const controller = new AbortController()
+  const waiting = edge.wait(controller.signal)
+  host.emit('agent/created', { agent: { parentAgent: {} } })
+  assert.equal(await stillWaiting(waiting), true, 'a subagent is not a Lead')
+
+  host.emit('agent/created', { agent: {} })
+  await within(waiting, 'root creation')
+
+  // A creation that lands while nothing is waiting is latched: the round that
+  // is about to start waiting must not miss the Team it was created for.
+  host.emit('agent/created', { agent: {} })
+  await within(edge.wait(controller.signal), 'latched creation')
+
+  // A malformed payload must not break the loop. `agent/created` is dispatched
+  // serially, so a throwing listener would fail agent creation itself.
+  host.emit('agent/created', undefined)
+
+  edge.dispose()
+  assert.equal(host.listenerCount(), 0, 'dispose drops the host subscription')
+})
+
+await testAsync('a reachable edge arms no timer at all', async () => {
+  // A host with an event bus needs no timer: the event is the only thing that
+  // can change the answer, and once the registration path that publishes the
+  // root is the same one that emits `agent/created`, the timer can only ask the
+  // same question on a schedule. Waking on the edge must therefore leave the
+  // sleeper untouched — not merely cancel a timer it started.
+  const host = eventHost()
+  const edge = createTeamEdge(host.ctx)
+  const controller = new AbortController()
+  let sleeps = 0
+  const started = Date.now()
+
+  const waiting = waitForIdleEdge(
+    edge,
+    () => {
+      sleeps += 1
+      // Never resolves: only the edge can end this wait.
+      return new Promise<void>(() => {})
+    },
+    30_000,
+    controller.signal,
+  )
+  host.emit('agent/created', { agent: {} })
+  await within(waiting, 'edge wake')
+
+  assert.equal(sleeps, 0, 'no fallback timer is armed when the event bus is reachable')
+  assert.ok(Date.now() - started < 1_000, 'the wait did not consume any delay')
+  edge.dispose()
+})
+
+await testAsync('a host without an event bus still backs off', async () => {
+  // A headless host (and any host assembled without the agent registry) has no
+  // `on`. That must degrade to the back-off, not to a crash or a busy spin.
+  const headless = createTeamEdge({} as unknown as HostCtx)
+  assert.equal(headless.available, false, 'no bus, no edge')
+  const slept: number[] = []
+  await waitForIdleEdge(
+    headless,
+    (ms: number) => {
+      slept.push(ms)
+      return Promise.resolve()
+    },
+    4_000,
+    new AbortController().signal,
+  )
+  assert.deepEqual(slept, [4_000], 'the unavailable edge falls back to the timer')
+
+  // The one state no creation event can explain is a root that is present but
+  // does not resolve as a Lead: an identity replaced mid-recomposition, a
+  // provider-owned root, a roster write still in flight. That state can settle
+  // on its own, so the caller bounds one re-read with `timeout` instead of
+  // waiting for an event that may never come.
+  const host = eventHost()
+  const reachable = createTeamEdge(host.ctx)
+  const again: number[] = []
+  await waitForIdleEdge(
+    reachable,
+    (ms: number) => {
+      again.push(ms)
+      return Promise.resolve()
+    },
+    1_000,
+    new AbortController().signal,
+    { timeout: true },
+  )
+  assert.deepEqual(again, [1_000], 'a bounded re-read still uses the timer')
+  reachable.dispose()
+})
+
+await testAsync('abort releases the idle wait', async () => {
+  const host = eventHost()
+  const edge = createTeamEdge(host.ctx)
+  const controller = new AbortController()
+  const waiting = edge.wait(controller.signal)
+  controller.abort()
+  await within(waiting, 'abort')
+  edge.dispose()
 })
 
 test('bounds how many team buckets it remembers', () => {

@@ -29,6 +29,7 @@ import type { AutopilotState, ParkRecord, TeamState } from './state.ts'
 import { pruneWakeStamps, wakeAllowance } from './budget.ts'
 import type { Liveness } from './liveness.ts'
 import { appendStatusLine, startupLine, statusLine, statusSignature } from './observe.ts'
+import { createTeamEdge, waitForIdleEdge } from './wakeup.ts'
 
 /**
  * Interruptible pause.
@@ -63,6 +64,46 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
  * capped by the configured interval so it can never become the cadence itself.
  */
 const MIN_ROUND_SPACING_MS = 1_000
+
+/**
+ * How long the loop sleeps when there is no Team to serve and no event bus.
+ *
+ * On a host that exposes `ctx.on`, the idle round waits for `agent/created`
+ * instead: a runtime root is published and announced on the same path, so the
+ * event is the state change rather than a hint that one may have happened, and
+ * the loop parks for free until a Lead actually exists. A host assembled
+ * without the agent registry has nothing to subscribe to, so there the wait is
+ * still a timer. Making that timer short would be a poll (43,200 wakeups a day
+ * to find nothing), so it backs off up to the configured interval.
+ */
+const IDLE_RETRY_MIN_MS = 2_000
+
+/** Ceiling on the idle back-off, so a new Team is never noticed late by much. */
+const IDLE_RETRY_MAX_MS = 30_000
+
+/**
+ * How long one idle round looks at a runtime root that is present but is not a
+ * Lead.
+ *
+ * `findLeads` resolves a root through `tryMembership`, which can legitimately
+ * answer "not a Lead" for a live root: the identity may have been replaced while
+ * the host recomposes sessions, or the root may be a provider-owned worker whose
+ * descriptor excludes it from a Team. The first case clears itself without a new
+ * creation event, so one bounded re-read is enough; after that the wait is the
+ * event again. This is not a cadence: with no root at all it never applies.
+ */
+const ROOT_GRACE_MS = 1_000
+
+/**
+ * Delay before re-checking for Teams after a round that found no Lead.
+ * @param idleRounds - consecutive rounds that found no Lead.
+ * @param ceilingMs - upper bound, normally the configured tick interval.
+ * @returns the pause duration in milliseconds.
+ */
+export function idleRetryDelay(idleRounds: number, ceilingMs: number): number {
+  const ceiling = Math.max(IDLE_RETRY_MIN_MS, Math.min(ceilingMs, IDLE_RETRY_MAX_MS))
+  return Math.min(IDLE_RETRY_MIN_MS * 2 ** Math.min(idleRounds, 8), ceiling)
+}
 
 /**
  * Exponential backoff for consecutive loop failures, capped at 30s.
@@ -827,6 +868,8 @@ export function pruneWakeMap(
  * @param state - autopilot state to update.
  * @param signal - cancellation signal.
  * @param liveness - observed turn boundaries, when tracking is enabled.
+ * @param sleep - the idle pause, injectable so its pacing can be observed
+ *   without spending wall-clock time in the test that checks it.
  */
 export async function loop(
   ctx: Context,
@@ -834,6 +877,7 @@ export async function loop(
   state: AutopilotState,
   signal: AbortSignal,
   liveness?: Liveness,
+  sleep: (ms: number, signal: AbortSignal) => Promise<void> = pause,
 ): Promise<void> {
   // Per-team runtime state, keyed by the TeamId resolved from each Lead.
   const teamWake = new Map<string, Map<string, number>>()
@@ -859,6 +903,12 @@ export async function loop(
   let failures = 0
   let lastRoundAt: number | undefined
   const spacingMs = Math.min(MIN_ROUND_SPACING_MS, config.tickTimeoutMs)
+
+  // The idle branch's only real edge: a runtime root appearing. A Team cannot
+  // exist without a Lead, and the Team service already wakes its own waiters on
+  // every roster or task append, so this one event is what a sleeping idle loop
+  // is actually missing. The timed back-off below stays as the fallback.
+  const idleEdge = createTeamEdge(ctx)
 
   // One line per process start, so the log says which build and which settings
   // are running. Without it a stale profile and a current one look the same
@@ -924,6 +974,10 @@ export async function loop(
     }
   }
 
+  // Consecutive rounds that found no Team. Reset by the first round that has a
+  // Lead to serve, so the back-off only ever describes an actually idle host.
+  let idleRounds = 0
+
   while (!signal.aborted) {
     // The whole round is fenced so one host exception cannot silently kill the
     // loop. `findLeads` (session recomposition), the change-wait race, and the
@@ -935,7 +989,7 @@ export async function loop(
     try {
       await runRound()
     } catch (error: unknown) {
-      if (signal.aborted) return
+      if (signal.aborted) break
       state.lastError = describe(error)
       // A round-level failure (resolving Leads, racing the change-waits) is
       // usually transient 鈥?session recomposition settles in milliseconds 鈥?so
@@ -944,9 +998,12 @@ export async function loop(
       // would let one recomposition spike the back-off to 30s and stall a
       // recovered host for half a minute for no reason.
       await pause(2_000, signal)
-      if (signal.aborted) return
+      if (signal.aborted) break
     }
   }
+  // Drop the host subscription before leaving, so a reloaded plugin and the old
+  // loop never share a listener.
+  idleEdge.dispose()
   return
 
   /**
@@ -959,9 +1016,24 @@ export async function loop(
     if (leads.length === 0) {
       waiters.clear()
       dirty.clear()
-      await pause(2_000, signal)
+      // There is nothing to arm a change-wait on, so wait for the one edge that
+      // can produce work: a runtime root appearing. The host publishes a root and
+      // emits `agent/created` on the same path, so this wait owns no timer; the
+      // back-off only exists for a host with no event bus at all. A root that is
+      // present yet does not resolve as a Lead is the one state a creation event
+      // cannot explain, so it gets exactly one short re-read.
+      const unclaimed = idleRounds === 0 && ctx.agents.roots().length > 0
+      await waitForIdleEdge(
+        idleEdge,
+        sleep,
+        unclaimed ? ROOT_GRACE_MS : idleRetryDelay(idleRounds, config.tickTimeoutMs),
+        signal,
+        { timeout: unclaimed },
+      )
+      idleRounds = Math.min(idleRounds + 1, 16)
       return
     }
+    idleRounds = 0
 
     // Arm a waiter for every live team that has none, and replace any waiter
     // bound to a Lead that has since been replaced. Every waiter is armed
