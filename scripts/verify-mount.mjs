@@ -5,7 +5,7 @@
  * This checks the *mount prerequisites* (files, entry points, lockfile, bundle
  * registration, first-run dryRun). It cannot prove the app actually loaded the
  * plugin — that requires restarting the app and observing it (see
- * docs/verify-host.md). Run it before AND after a restart; the "runtime" part
+ * docs/verify.md). Run it before AND after a restart; the "runtime" part
  * is what the app logs and the `team_autopilot_status` tool tell you.
  *
  * Usage:

@@ -69,7 +69,7 @@ const required = [
   'cordis.patch.yml',
   'dist/index.mjs',
   'dist/index.d.mts',
-  'docs/verify-host.md',
+  'docs/verify.md',
 ]
 for (const file of required) {
   check(`shipped: ${file}`, shipped.has(file))

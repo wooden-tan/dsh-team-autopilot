@@ -12,6 +12,15 @@
 - **项目停止维护。** 不再加功能、不再排待办，代码停在 0.6.7。原因、停止前逐条核实的官方能力边界（投递确认 / token 预算 / per-member model / 独立工作目录 / toolPolicies / 叫醒 Lead / 命令面）、磁盘上的残留与卸载方式，见 [docs/stopped.md](docs/stopped.md)。
 - 文档更正：README 设计决策第 10 条末「想让卡死/停派主动上报到 Lead 时路是堵的」不准确。`Agent.inject()` 能把消息递到 Lead 的下一步，只是**不唤醒**空闲 driver；`steer()` 与 `send(msg, target, wakeup=true)` 能唤醒，代价是一整轮 token，且消息以 user 角色出现在 Lead 会话里。因此上报仍只走三条零 token 通道。
 
+### 文档
+
+- **按「读者要做什么」重排：12 个 markdown → 5 个，README 从 512 行降到约 190 行。** 基准是同类 DSH 插件仓库：README 一律只留「装上怎么用」（安装 / 一张配置表 / 怎么验证 / 字段速查），历史、设计论证、验证记录搬进 `docs/`——有仓库的 `docs/` 比 README 大好几倍，最大的 CHANGELOG 有 190 KB，没人要求它们瘦。原来 README 里约 250 行是「真机验证记录 / 设计决策 / 可观测性详解 / statusFile / 边界 / 官方会不会做」这类内容，属于项目档案而非使用说明。
+- 新增 [docs/design.md](docs/design.md)：与别的团队插件的差异、能否共存、11 条设计决策、真机验证记录（四次实证）、仍未验证、status 与 statusFile 详解、边界、开发与发布。**内容是按行切块搬过去的，不是重写**，只补了页面级的开场与目录。
+- 新增 [docs/verify.md](docs/verify.md)：原来的 `verify-host.md` + `verify-reclaim.md` + `verify-multiteam.md` 合成一本手册（第 1/2/3 部分），两套「可直接粘贴的提示词」降为附录 A/B；标题整体降一级，代码块内不动，跨文件链接改成本页小节引用。
+- [docs/stopped.md](docs/stopped.md) 吸收 `docs/distribution.md`：新增「为什么没分发（2026-10-28 目录快照）」一节（7406 条目录 / 3823 条带 npm 映射 / `workflow` 413 条 / 本项目不在其中；topic 已铺、应用内市场只能靠投稿 PR），并保留当时的竞争位说明。
+- 删除已被取代或已并入的文件：`docs/team-collab-task.md`（v1，早已标注被 v2 取代）、`docs/verify-host.md`、`docs/verify-reclaim.md`、`docs/verify-multiteam.md`、`docs/prompts-dispatch.md`、`docs/prompts-reclaim.md`、`docs/distribution.md`。内容都在上面几份里，逐条改动可在 git 历史里查。
+- `scripts/verify-pack.mjs` 的必需文件清单跟着 `docs/verify-host.md` → `docs/verify.md` 改名；`scripts/verify-mount.mjs` 的注释同步。README 的相对链接全部改为新路径（`verify-pack.mjs` 会检查这些链接在发布包内可解析，删文件后漏改会直接 FAIL）。
+
 ## [0.6.7] - 2026-11-02
 
 ### 修复
